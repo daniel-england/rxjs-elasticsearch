@@ -1,0 +1,21 @@
+{
+  "name": "rxjs-elasticsearch",
+  "version": "1.0.0",
+  "main": "dist/index",
+  "types": "dist/index",
+  "scripts": {
+    "ts:defs": "tsc --declaration --outDir . --emitDeclarationOnly",
+    "build": "tsc",
+    "test": "ts-node src/test.ts"
+  },
+  "dependencies": {
+    "elasticsearch": "^15.4.1",
+    "rxjs": "^6.4.0"
+  },
+  "devDependencies": {
+    "faker": "^4.1.0",
+    "ts-node": "^8.0.2",
+    "tslint": "^5.16.0",
+    "typescript": "^3.3.3"
+  }
+}
