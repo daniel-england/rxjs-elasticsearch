@@ -96,18 +96,14 @@ export const extend = (client: Client) => {
             const scroll = '10s';
             const maxBatchSize = 10;
             const numberToGet = params.size;
-            console.log('numToGet', numberToGet);
 
             params.scroll = scroll;
             params.size = numberToGet && numberToGet < maxBatchSize ? numberToGet : undefined || maxBatchSize;
             const numBatches = numberToGet ? Math.ceil(numberToGet/params.size) : undefined;
-            console.log('params.size', params.size);
-            console.log('numBatches', numBatches);
 
             return from(client.search(params, options))
                 .pipe(
                     expand((res: ApiResponse<SearchResponse<T>>) => {
-                        //console.log('requested', res?.meta?.request?.params);
                         return res.body._scroll_id && res.body.hits.hits.length === params.size ?
                             client.scroll({
                                 scroll,
