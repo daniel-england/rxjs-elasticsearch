@@ -1,12 +1,10 @@
-import {
-    BulkOptions,
-    BulkResponse,
-    Client,
-    ConfigOptions, Hit,
-    SearchParams, SearchResponse
-} from 'elasticsearch';
-import {from, Observable, EMPTY, OperatorFunction} from "rxjs";
-import {bufferCount, expand, map, mergeMap, takeWhile} from "rxjs/operators";
+import {ApiResponse, Client} from '@elastic/elasticsearch';
+import {Bulk, Scroll, Search} from '@elastic/elasticsearch/api/requestParams';
+import {TransportRequestOptions} from '@elastic/elasticsearch/lib/Transport';
+import {EMPTY, from, Observable, OperatorFunction} from 'rxjs';
+import {bufferCount, expand, map, mergeMap, takeWhile, tap, take} from 'rxjs/operators';
+
+export type RxBulkRequest = Omit<Bulk, 'body'>;
 
 export interface BulkAction {
     action: 'index' | 'update' | 'delete' | 'create';
@@ -16,75 +14,124 @@ export interface BulkAction {
 }
 
 interface BulkActionWithPayload extends BulkAction {
-    payload: any
+    payload: any;
 }
 
 export interface IndexBulkAction extends BulkActionWithPayload {
-    action: 'update',
-    if_seq_no?: number,
-    if_primary_term?: number
+    action: 'update';
+    if_seq_no?: number;
+    if_primary_term?: number;
 }
 
 export interface UpdateBulkAction extends BulkActionWithPayload {
-    action: 'update',
-    payload: any,
+    action: 'update';
+    payload: any;
     retry_on_conflict?: number;
 }
 
 export interface DeleteBulkAction extends BulkAction {
-    action: 'delete',
-    if_seq_no?: number,
-    if_primary_term?: number
+    action: 'delete';
+    if_seq_no?: number;
+    if_primary_term?: number;
+}
+
+interface ShardsResponse {
+    total: number;
+    successful: number;
+    failed: number;
+    skipped: number;
+}
+
+export interface Explanation {
+    value: number;
+    description: string;
+    details: Explanation[];
+}
+
+export interface Hit<T> {
+    _index: string;
+    _type: string;
+    _id: string;
+    _score: number;
+    _source: T;
+    _version?: number;
+    _explanation?: Explanation;
+    fields?: any;
+    highlight?: any;
+    inner_hits?: any;
+    matched_queries?: string[];
+    sort?: string[];
+}
+
+interface SearchResponse<T> {
+    took: number;
+    timed_out: boolean;
+    _scroll_id?: string;
+    _shards: ShardsResponse;
+    hits: {
+        total: number;
+        max_score: number;
+        hits: Array<Hit<T>>;
+    };
+    aggregations?: any;
 }
 
 const hasPayload = (action: BulkAction | BulkActionWithPayload): action is BulkActionWithPayload => {
-    return (<BulkActionWithPayload>action).payload !== undefined
+    return (action as BulkActionWithPayload).payload !== undefined;
 };
 
-const toArray = <T extends BulkAction> (bulkAction: T) : Array<any> => {
+const toArray = <T extends BulkAction>(bulkAction: T): any[] => {
     if (hasPayload(bulkAction)) {
         const {action, payload, ...metadataPayload} = bulkAction;
         return [{[action]: metadataPayload}, payload];
     } else {
         const {action, ...metadataPayload} = bulkAction;
-        return [{[action]: metadataPayload}]
+        return [{[action]: metadataPayload}];
     }
 };
 
-export class RxjsEsClient {
-    private client: Client;
+export const extend = (client: Client) => {
+    client.extend('rxSearch', () => {
+        return function rxSearch<T>(params: Search, options?: TransportRequestOptions): Observable<Hit<T>> {
+            const scroll = '10s';
+            const maxBatchSize = 10;
+            const numberToGet = params.size;
+            console.log('numToGet', numberToGet);
 
-    constructor(options: ConfigOptions) {
-        this.client = new Client(options);
-    }
+            params.scroll = scroll;
+            params.size = numberToGet && numberToGet < maxBatchSize ? numberToGet : undefined || maxBatchSize;
+            const numBatches = numberToGet ? Math.ceil(numberToGet/params.size) : undefined;
+            console.log('params.size', params.size);
+            console.log('numBatches', numBatches);
 
-    stream<T>(search: SearchParams, batchSize?: number): Observable<Hit<T>> {
-        const scroll = '10s';
-        search.scroll = scroll;
-        search.size = batchSize || 1000;
+            return from(client.search(params, options))
+                .pipe(
+                    expand((res: ApiResponse<SearchResponse<T>>) => {
+                        //console.log('requested', res?.meta?.request?.params);
+                        return res.body._scroll_id && res.body.hits.hits.length === params.size ?
+                            client.scroll({
+                                scroll,
+                                scrollId: res.body._scroll_id
+                        } as Scroll) : EMPTY
+                    }),
+                    numberToGet ? take(numBatches) : takeWhile((res: ApiResponse<SearchResponse<T>>) => res.body.hits.hits.length > 0),
+                    mergeMap((res: ApiResponse<SearchResponse<T>>) => from(res.body.hits.hits)),
+                    numberToGet ? take(numberToGet) : tap(() => {})
+                );
+        };
+    });
 
-        return from(this.client.search(search))
-            .pipe(
-                expand((res: SearchResponse<T>) => res._scroll_id ? this.client.scroll({
-                    scroll: scroll,
-                    scrollId: res._scroll_id
-                }) : EMPTY),
-                takeWhile((res: SearchResponse<T>) => res.hits.total > 0),
-                mergeMap((res: SearchResponse<T>) => from(res.hits.hits))
-            )
-    }
-
-    bulkStream(options?: BulkOptions, batchSize?: number, bufferFunction?: Function): OperatorFunction<BulkAction, BulkResponse> {
-        const client = this.client;
-        const bufferSize = batchSize || 100;
-        return <OperatorFunction<BulkAction, BulkResponse>> function (source: Observable<BulkAction>) {
-            return source.pipe(
-                bufferFunction ? bufferFunction() : bufferCount(bufferSize),
-                map((bulkActions: Array<BulkAction>) => bulkActions
-                    .reduce((body: Array<any>, bulkAction: BulkAction) => body.concat(toArray(bulkAction)), [])
-                ),
-                mergeMap((body: Array<any>) => client.bulk({...options, body}))
-            );
-        }
-    }
-}
+    client.extend('rxBulk', () => {
+        return function bulkStream(params?: RxBulkRequest, options?: TransportRequestOptions, batchSize?: number): OperatorFunction<BulkAction, ApiResponse> {
+            const bufferSize = batchSize || 100;
+            return (source: Observable<BulkAction>) =>
+                source.pipe(
+                    bufferCount(bufferSize),
+                    map((bulkActions: BulkAction[]) => bulkActions
+                        .reduce((body: any[], bulkAction: BulkAction) => body.concat(toArray(bulkAction)), [])
+                    ),
+                    mergeMap((body: any[]) => client.bulk({...params, body} as Bulk, options))
+                );
+        };
+    });
+};
